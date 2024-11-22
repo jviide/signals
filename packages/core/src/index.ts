@@ -5,10 +5,11 @@ const BRAND_SYMBOL = Symbol.for("preact-signals");
 // Flags for Computed and Effect.
 const RUNNING = 1 << 0;
 const NOTIFIED = 1 << 1;
-const OUTDATED = 1 << 2;
-const DISPOSED = 1 << 3;
-const HAS_ERROR = 1 << 4;
-const TRACKING = 1 << 5;
+const MAY_RECOMPUTE = 1 << 2;
+const MUST_RECOMPUTE = 1 << 3;
+const DISPOSED = 1 << 4;
+const HAS_ERROR = 1 << 5;
+const TRACKING = 1 << 6;
 
 // A linked list node used to track dependencies (sources) and dependents (targets).
 // Also used to remember the source's last version number that the target saw.
@@ -58,7 +59,10 @@ function endBatch() {
 			effect._nextBatchedEffect = undefined;
 			effect._flags &= ~NOTIFIED;
 
-			if (!(effect._flags & DISPOSED) && needsToRecompute(effect)) {
+			if (
+				!(effect._flags & DISPOSED) &&
+				(effect._flags & MUST_RECOMPUTE || needsToRecompute(effect))
+			) {
 				try {
 					effect._callback();
 				} catch (err) {
@@ -377,7 +381,7 @@ Object.defineProperty(Signal.prototype, "value", {
 					node !== undefined;
 					node = node._nextTarget
 				) {
-					node._target._notify();
+					node._target._notify(MUST_RECOMPUTE);
 				}
 			} finally {
 				endBatch();
@@ -509,6 +513,39 @@ function cleanupSources(target: Computed | Effect) {
 	target._sources = head;
 }
 
+function recompute(computed: Computed) {
+	const prevContext = evalContext;
+
+	let value: unknown;
+	let flag = 0;
+	try {
+		prepareSources(computed);
+		evalContext = computed;
+		value = computed._fn();
+	} catch (err) {
+		value = err;
+		flag = HAS_ERROR;
+	}
+	evalContext = prevContext;
+	cleanupSources(computed);
+
+	if (computed._value !== value || (computed._flags & HAS_ERROR) !== flag) {
+		computed._value = value;
+		computed._flags = (computed._flags & ~HAS_ERROR) | flag;
+		computed._version++;
+
+		if (computed._flags & TRACKING) {
+			for (
+				let node = computed._targets;
+				node !== undefined;
+				node = node._nextTarget
+			) {
+				node._target._flags |= MUST_RECOMPUTE;
+			}
+		}
+	}
+}
+
 declare class Computed<T = any> extends Signal<T> {
 	_fn: () => T;
 	_sources?: Node;
@@ -517,7 +554,7 @@ declare class Computed<T = any> extends Signal<T> {
 
 	constructor(fn: () => T);
 
-	_notify(): void;
+	_notify(flags?: number): void;
 	get value(): T;
 }
 
@@ -527,7 +564,7 @@ function Computed(this: Computed, fn: () => unknown) {
 	this._fn = fn;
 	this._sources = undefined;
 	this._globalVersion = globalVersion - 1;
-	this._flags = OUTDATED;
+	this._flags = MAY_RECOMPUTE | MUST_RECOMPUTE;
 }
 
 Computed.prototype = new Signal() as Computed;
@@ -540,12 +577,12 @@ Computed.prototype._refresh = function () {
 	}
 
 	// If this computed signal has subscribed to updates from its dependencies
-	// (TRACKING flag set) and none of them have notified about changes (OUTDATED
-	// flag not set), then the computed value can't have changed.
-	if ((this._flags & (OUTDATED | TRACKING)) === TRACKING) {
+	// (TRACKING flag set) and none of them have notified about changes
+	// (MAY_RECOMPUTE flag not set), then the computed value can't have changed.
+	if ((this._flags & (MAY_RECOMPUTE | TRACKING)) === TRACKING) {
 		return true;
 	}
-	this._flags &= ~OUTDATED;
+	this._flags &= ~MAY_RECOMPUTE;
 
 	if (this._globalVersion === globalVersion) {
 		return true;
@@ -555,39 +592,22 @@ Computed.prototype._refresh = function () {
 	// Mark this computed signal running before checking the dependencies for value
 	// changes, so that the RUNNING flag can be used to notice cyclical dependencies.
 	this._flags |= RUNNING;
-	if (this._version > 0 && !needsToRecompute(this)) {
-		this._flags &= ~RUNNING;
-		return true;
+	if (this._flags & MUST_RECOMPUTE || needsToRecompute(this)) {
+		recompute(this);
 	}
 
-	const prevContext = evalContext;
-	try {
-		prepareSources(this);
-		evalContext = this;
-		const value = this._fn();
-		if (
-			this._flags & HAS_ERROR ||
-			this._value !== value ||
-			this._version === 0
-		) {
-			this._value = value;
-			this._flags &= ~HAS_ERROR;
-			this._version++;
-		}
-	} catch (err) {
-		this._value = err;
-		this._flags |= HAS_ERROR;
-		this._version++;
-	}
-	evalContext = prevContext;
-	cleanupSources(this);
-	this._flags &= ~RUNNING;
+	// Unset the RUNNING and MUST_RECOMPUTE flags. There are situations where
+	// the MUST_RECOMPUTE flag could stay set in the optimal case (e.g
+	// running the computed modifies a signal that is a direct or indirect
+	// dependency). However, the results will still stay correct as the
+	// flag is just used as an optimization, not the final source of truth.
+	this._flags &= ~RUNNING & ~MUST_RECOMPUTE;
 	return true;
 };
 
 Computed.prototype._subscribe = function (node) {
 	if (this._targets === undefined) {
-		this._flags |= OUTDATED | TRACKING;
+		this._flags |= MAY_RECOMPUTE | TRACKING;
 
 		// A computed signal subscribes lazily to its dependencies when it
 		// gets its first subscriber.
@@ -623,17 +643,21 @@ Computed.prototype._unsubscribe = function (node) {
 	}
 };
 
-Computed.prototype._notify = function () {
+Computed.prototype._notify = function (flags?: number) {
 	if (!(this._flags & NOTIFIED)) {
-		this._flags |= OUTDATED | NOTIFIED;
+		this._flags |= MAY_RECOMPUTE | NOTIFIED;
 
 		for (
 			let node = this._targets;
 			node !== undefined;
 			node = node._nextTarget
 		) {
-			node._target._notify();
+			node._target._notify(0);
 		}
+	}
+
+	if (flags) {
+		this._flags |= flags;
 	}
 };
 
@@ -726,7 +750,7 @@ function endEffect(this: Effect, prevContext?: Computed | Effect) {
 	cleanupSources(this);
 	evalContext = prevContext;
 
-	this._flags &= ~RUNNING;
+	this._flags &= ~RUNNING & ~MUST_RECOMPUTE;
 	if (this._flags & DISPOSED) {
 		disposeEffect(this);
 	}
@@ -746,7 +770,7 @@ declare class Effect {
 
 	_callback(): void;
 	_start(): () => void;
-	_notify(): void;
+	_notify(flags?: number): void;
 	_dispose(): void;
 }
 
@@ -788,11 +812,15 @@ Effect.prototype._start = function () {
 	return endEffect.bind(this, prevContext);
 };
 
-Effect.prototype._notify = function () {
+Effect.prototype._notify = function (flags?: number) {
 	if (!(this._flags & NOTIFIED)) {
 		this._flags |= NOTIFIED;
 		this._nextBatchedEffect = batchedEffect;
 		batchedEffect = this;
+	}
+
+	if (flags) {
+		this._flags |= flags;
 	}
 };
 
